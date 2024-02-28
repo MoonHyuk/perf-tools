@@ -118,60 +118,12 @@ sub appendto {
 	close FILE or return 0;
 }
 
-# kprobe functions
-sub create_kprobe {
-	my ($kname, $kval) = @_;
-	appendto "p:$kname $kval", "kprobe_events" or return 0;
+sub enable_tracepoint_tcp_retrans {
+	writeto "1", "events/tcp/tcp_retransmit_skb/enable" or return 0;
 }
 
-sub enable_kprobe {
-	my ($kname) = @_;
-	writeto "1", "events/kprobes/$kname/enable" or return 0;
-}
-
-sub remove_kprobe {
-	my ($kname) = @_;
-	writeto "0", "events/kprobes/$kname/enable" or return 0;
-	appendto "-:$kname", "kprobe_events" or return 0;
-}
-
-# tcp socket cache
-my %tcp;
-sub cache_tcp {
-	undef %tcp;
-	open(TCP, "/proc/net/tcp") or ldie "ERROR: reading /proc/net/tcp.";
-	while (<TCP>) {
-		next if /^ *sl/;
-		my ($sl, $local_address, $rem_address, $st, $tx_rx, $tr_tm,
-		    $retrnsmt, $uid, $timeout, $inode, $jf, $sk) = split;
-		$sk =~ s/^0x//;
-		$tcp{$sk}{laddr} = $local_address;
-		$tcp{$sk}{raddr} = $rem_address;
-		$tcp{$sk}{state} = $st;
-	}
-	close TCP;
-}
-
-my @tcpstate;
-sub map_tcp_states {
-	push @tcpstate, "NULL";
-	for (<DATA>) {
-		chomp;
-		s/.*TCP_//;
-		s/[, ].*$//;
-		push @tcpstate, $_;
-	}
-}
-
-# /proc/net/tcp hex addr to dotted quad decimal
-sub inet_h2a {
-	my ($haddr) = @_;
-
-	my @addr = ();
-	for my $num ($haddr =~ /(..)(..)(..)(..)/) {
-		unshift @addr, hex($num);
-	}
-	return join(".", @addr);
+sub remove_tracepoint_tcp_retrans {
+	writeto "0", "events/tcp/tcp_retransmit_skb/enable" or return 0;
 }
 
 ### check permissions
@@ -191,33 +143,14 @@ writeto "$$", $flock or die "ERROR: unable to write $flock.";
 # kernel is not left in a partially configured state.
 #
 writeto "nop", "current_tracer" or ldie "ERROR: disabling current_tracer.";
-my $kname_rtr = "tcpretrans_tcp_retransmit_skb";
-my $kname_tlp = "tcpretrans_tcp_send_loss_probe";
-create_kprobe $kname_rtr, "tcp_retransmit_skb sk=%di" or
-    ldie "ERROR: creating kprobe for tcp_retransmit_skb().";;
-if ($tlp) {
-	create_kprobe $kname_tlp, "tcp_send_loss_probe sk=%di" or
-	    edie "ERROR: creating kprobe for tcp_send_loss_probe(). " .
-	         "Older kernel version?";
-}
-if ($stacks) {
-	writeto "1", "options/stacktrace" or print STDERR "WARNING: " .
-	    "unable to enable stacktraces.\n";
-}
-enable_kprobe $kname_rtr or edie "ERROR: enabling $kname_rtr probe.";
-if ($tlp) {
-	enable_kprobe $kname_tlp or edie "ERROR: enabling $kname_tlp probe.";
-}
-map_tcp_states();
-printf "%-8s %-6s %-20s -- %-20s %-12s\n", "TIME", "PID", "LADDR:LPORT",
-    "RADDR:RPORT", "STATE";
+enable_tracepoint_tcp_retrans or
+	edie "ERROR: enabling events/tcp/tcp_retransmit_skb. " .
+	"Older kernel version?";
 
+printf "%-8s %-6s %-20s -- %-20s %-12s\n", "TIME", "PID", "LADDR:LPORT",
+	"RADDR:RPORT", "STATE";
 #
-# Read and print event data. This loop waits one second then reads the buffered
-# trace data, then caches /proc/net/tcp, then iterates over the buffered trace
-# data using the cached state. While this minimizes CPU overheads, it only
-# works because sockets that are retransmitting are usually long lived, and
-# remain in /proc/net/tcp for at least our sleep interval.
+# Read and print event data.
 #
 while (1) {
 	sleep $interval;
@@ -232,46 +165,16 @@ while (1) {
 	close TPIPE;
 	writeto "0", "trace" or edie "ERROR: clearing trace";
 
-	# cache /proc/net/tcp state
-	if (scalar @trace) {
-		cache_tcp();
-	}
-
 	# process and print events
 	for (@trace) {
-		if ($stacks && /^ *=>/) {
-			print $_;
-			next;
+		if (index($_, " tcp_retransmit_skb:") != -1) {
+			my ($taskpid, $rest) = split ' ', $_, 2;
+			my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
+			my ($lport, $rport, $laddr, $raddr, $state) = $rest =~ /sport=([0-9]+) dport=([0-9]+) saddr=([0-9\.]+) daddr=([0-9\.]+) saddrv6=[0-9a-fA-F:\.]+ daddrv6=[0-9a-fA-F:\.]+ state=([A-Z_]+)/;
+			my $now = strftime "%H:%M:%S", localtime;
+			printf "%-8s %-6s %-20s %s> %-20s %-12s\n", $now, $pid,
+			"$laddr:$lport", "R", "$raddr:$rport", $state,
 		}
-
-		my ($taskpid, $rest) = split ' ', $_, 2;
-		my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
-
-		my ($skp) = $rest =~ /sk=([0-9a-fx]*)/;
-		next unless defined $skp and $skp ne "";
-		$skp =~ s/^0x//;
-
-		my ($laddr, $lport, $raddr, $rport, $state);
-		if (defined $tcp{$skp}) {
-			# convert /proc/net/tcp hex to dotted quads
-			my ($hladdr, $hlport) = split /:/, $tcp{$skp}{laddr};
-			my ($hraddr, $hrport) = split /:/, $tcp{$skp}{raddr};
-			$laddr = inet_h2a($hladdr);
-			$raddr = inet_h2a($hraddr);
-			$lport = hex($hlport);
-			$rport = hex($hrport);
-			$state = $tcpstate[hex($tcp{$skp}{state})];
-		} else {
-			# socket closed too quickly
-			($laddr, $raddr) = ("-", "-");
-			($lport, $rport) = ("-", "-");
-			$state = "-";
-		}
-
-		my $now = strftime "%H:%M:%S", localtime;
-		printf "%-8s %-6s %-20s %s> %-20s %-12s\n", $now, $pid,
-		    "$laddr:$lport", $rest =~ /$kname_tlp/ ? "L" : "R",
-		    "$raddr:$rport", $state,
 	}
 }
 
@@ -281,31 +184,10 @@ cleanup();
 sub cleanup {
 	print "\nEnding tracing...\n";
 	close TPIPE;
-	if ($stacks) {
-		writeto "0", "options/stacktrace" or print STDERR "WARNING: " .
-		    "unable to disable stacktraces.\n";
-	}
-	remove_kprobe $kname_rtr
-	    or print STDERR "ERROR: removing kprobe $kname_rtr\n";
-	if ($tlp) {
-		remove_kprobe $kname_tlp
-		    or print STDERR "ERROR: removing kprobe $kname_tlp\n";
-	}
+	remove_tracepoint_tcp_retrans
+	or print STDERR "ERROR: removing tracepoint tcp_retrans\n";
+
 	writeto "", "trace";
 	unlink $flock;
 	exit;
 }
-
-# from /usr/include/netinet/tcp.h:
-__DATA__
-  TCP_ESTABLISHED = 1,
-  TCP_SYN_SENT,
-  TCP_SYN_RECV,
-  TCP_FIN_WAIT1,
-  TCP_FIN_WAIT2,
-  TCP_TIME_WAIT,
-  TCP_CLOSE,
-  TCP_CLOSE_WAIT,
-  TCP_LAST_ACK,
-  TCP_LISTEN,
-  TCP_CLOSING   /* now a valid state */
